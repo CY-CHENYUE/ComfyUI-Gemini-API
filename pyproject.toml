@@ -1,0 +1,15 @@
+[project]
+name = "gemini-api"
+description = "A custom node for ComfyUI to integrate Google Gemini API."
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = ["google-genai>=1.5.0", "Pillow", "requests", "numpy", "torch"]
+
+[project.urls]
+Repository = "https://github.com/CY-CHENYUE/ComfyUI-Gemini-API"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI-Gemini-API"
+Icon = ""
