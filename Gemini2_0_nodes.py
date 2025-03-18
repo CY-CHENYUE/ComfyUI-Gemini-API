@@ -360,11 +360,211 @@ class GeminiImageGenerator:
             full_text = "## 处理日志\n" + "\n".join(self.log_messages) + "\n\n## 错误\n" + error_message
             return (self.generate_empty_image(512, 512), full_text)
 
+class GeminiMultiImageGenerator(GeminiImageGenerator):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True}),
+                "api_key": ("STRING", {"default": "", "multiline": False}),
+                "model": (["models/gemini-2.0-flash-exp"], {"default": "models/gemini-2.0-flash-exp"}),
+                "width": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 8}),
+                "height": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 8}),
+                "temperature": ("FLOAT", {"default": 1, "min": 0.0, "max": 2.0, "step": 0.05}),
+            },
+            "optional": {
+                "seed": ("INT", {"default": 66666666, "min": 0, "max": 2147483647}),
+                "image1": ("IMAGE",),
+                "image2": ("IMAGE",),
+                "image3": ("IMAGE",),
+                "image4": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "API Respond")
+    FUNCTION = "generate_multi_image"
+    CATEGORY = "Google-Gemini"
+
+    def process_single_image(self, image, idx):
+        """处理单张图片"""
+        try:
+            if len(image.shape) == 4 and image.shape[0] == 1:
+                input_image = image[0].cpu().numpy()
+                input_image = (input_image * 255).astype(np.uint8)
+                pil_image = Image.fromarray(input_image)
+                
+                img_byte_arr = BytesIO()
+                pil_image.save(img_byte_arr, format='PNG')
+                img_byte_arr.seek(0)
+                image_bytes = img_byte_arr.read()
+                
+                self.log(f"参考图片 {idx} 处理成功，尺寸: {pil_image.width}x{pil_image.height}")
+                return {"mime_type": "image/png", "data": image_bytes}
+        except Exception as e:
+            self.log(f"处理参考图片 {idx} 失败: {str(e)}")
+        return None
+
+    def generate_multi_image(self, prompt, api_key, model, width, height, temperature, seed=66666666, **kwargs):
+        """支持多张参考图片的生成函数"""
+        response_text = ""
+        self.log_messages = []
+        
+        try:
+            actual_api_key = self.get_api_key(api_key)
+            if not actual_api_key:
+                error_message = "错误: 未提供有效的API密钥。请在节点中输入API密钥或确保已保存密钥。"
+                self.log(error_message)
+                full_text = "## 错误\n" + error_message + "\n\n## 使用说明\n1. 在节点中输入您的Google API密钥\n2. 密钥将自动保存到节点目录，下次可以不必输入"
+                return (self.generate_empty_image(512, 512), full_text)  # 使用默认尺寸的空白图像
+
+            client = genai.Client(api_key=actual_api_key)
+            
+            # 处理种子值
+            if seed == 0:
+                import random
+                seed = random.randint(1, 2**31 - 1)
+                self.log(f"生成随机种子值: {seed}")
+            else:
+                self.log(f"使用指定的种子值: {seed}")
+            
+            # 构建提示词
+            aspect_ratio = width / height
+            orientation = "landscape (horizontal)" if aspect_ratio > 1 else "portrait (vertical)" if aspect_ratio < 1 else "square"
+            simple_prompt = f"Create a detailed image of: {prompt}. Generate the image in {orientation} orientation with exact dimensions of {width}x{height} pixels."
+
+            # 处理所有参考图片
+            contents = []
+            ref_count = 0
+            
+            # 处理所有图片输入
+            for key, image in kwargs.items():
+                if key.startswith('image') and image is not None:
+                    img_data = self.process_single_image(image, ref_count + 1)
+                    if img_data:
+                        contents.append({"inline_data": img_data})
+                        ref_count += 1
+                        self.log(f"参考图片 {key} 处理成功")
+
+            # 添加提示词
+            if ref_count > 0:
+                contents.append({"text": f"{simple_prompt} Use these {ref_count} reference images as style guidance."})
+                self.log(f"成功添加 {ref_count} 张参考图片")
+            else:
+                contents = simple_prompt
+
+            # 生成配置
+            gen_config = types.GenerateContentConfig(
+                temperature=temperature,
+                seed=seed,
+                response_modalities=['Text', 'Image']
+            )
+
+            # 调用API
+            self.log(f"请求Gemini API生成图像，种子值: {seed}, 包含参考图片数: {ref_count}")
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=gen_config
+            )
+
+            # 响应处理
+            self.log("API响应接收成功，正在处理...")
+            
+            if not hasattr(response, 'candidates') or not response.candidates:
+                self.log("API响应中没有candidates")
+                full_text = "\n".join(self.log_messages) + "\n\nAPI返回了空响应"
+                return (self.generate_empty_image(width, height), full_text)
+            
+            # 检查响应中是否有图像
+            image_found = False
+            
+            # 遍历响应部分
+            for part in response.candidates[0].content.parts:
+                # 检查是否为文本部分
+                if hasattr(part, 'text') and part.text is not None:
+                    text_content = part.text
+                    response_text += text_content
+                    self.log(f"API返回文本: {text_content[:100]}..." if len(text_content) > 100 else text_content)
+                
+                # 检查是否为图像部分
+                elif hasattr(part, 'inline_data') and part.inline_data is not None:
+                    self.log("API返回数据解析处理")
+                    try:
+                        # 获取图像数据
+                        image_data = part.inline_data.data
+                        mime_type = part.inline_data.mime_type if hasattr(part.inline_data, 'mime_type') else "未知"
+                        self.log(f"图像数据类型: {type(image_data)}, MIME类型: {mime_type}, 数据长度: {len(image_data) if image_data else 0}")
+                        
+                        # 记录前8个字节用于诊断
+                        if image_data and len(image_data) > 8:
+                            hex_prefix = ' '.join([f'{b:02x}' for b in image_data[:8]])
+                            self.log(f"图像数据前8字节: {hex_prefix}")
+                            
+                            # 检测Base64编码的PNG
+                            if hex_prefix.startswith('69 56 42 4f 52'):
+                                try:
+                                    self.log("检测到Base64编码的PNG，正在解码...")
+                                    base64_str = image_data.decode('utf-8', errors='ignore')
+                                    image_data = base64.b64decode(base64_str)
+                                    self.log(f"Base64解码成功，新数据长度: {len(image_data)}")
+                                except Exception as e:
+                                    self.log(f"Base64解码失败: {str(e)}")
+                        
+                        # BytesIO正确使用方法 - 修改为更直接的初始化方式
+                        try:
+                            # 直接使用字节数据初始化BytesIO，更简洁更兼容
+                            buffer = BytesIO(image_data)
+                            
+                            # 尝试打开图像
+                            pil_image = Image.open(buffer)
+                            self.log(f"成功打开图像: {pil_image.width}x{pil_image.height}, 格式: {pil_image.format}")
+                            
+                            if pil_image.mode != 'RGB':
+                                pil_image = pil_image.convert('RGB')
+                            
+                            # 转换为ComfyUI格式
+                            img_array = np.array(pil_image).astype(np.float32) / 255.0
+                            img_tensor = torch.from_numpy(img_array).unsqueeze(0)
+                            
+                            image_found = True
+                            self.log(f"图像转换为张量成功, 形状: {img_tensor.shape}")
+                            
+                            # 合并日志和API返回文本
+                            full_text = "## 处理日志\n" + "\n".join(self.log_messages) + "\n\n## API返回\n" + response_text
+                            return (img_tensor, full_text)
+                            
+                        except Exception as e:
+                            self.log(f"使用BytesIO打开图像失败: {str(e)}")
+                            self.log("无法处理图像数据，使用默认空白图像")
+                            img_tensor = self.generate_empty_image(width, height)
+                    except Exception as e:
+                        self.log(f"图像处理错误: {e}")
+                        traceback.print_exc()
+            
+            # 没有找到图像数据，但可能有文本
+            if not image_found:
+                self.log("API响应中未找到图像数据，仅返回文本")
+                if not response_text:
+                    response_text = "API未返回任何图像或文本"
+            
+            # 合并日志和API返回文本
+            full_text = "## 处理日志\n" + "\n".join(self.log_messages) + "\n\n## API返回\n" + response_text
+            return (self.generate_empty_image(width, height), full_text)
+
+        except Exception as e:
+            error_message = f"处理过程中出错: {str(e)}"
+            self.log(f"Gemini多图片生成错误: {str(e)}")
+            full_text = "## 处理日志\n" + "\n".join(self.log_messages) + "\n\n## 错误\n" + error_message
+            return (self.generate_empty_image(width, height), full_text)
+
 # 注册节点
 NODE_CLASS_MAPPINGS = {
-    "Google-Gemini": GeminiImageGenerator
+    "Google-Gemini": GeminiImageGenerator,
+    "Google-Gemini-Multi": GeminiMultiImageGenerator
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Google-Gemini": "Gemini 2.0 image"
-} 
+    "Google-Gemini": "Gemini 2.0 image",
+    "Google-Gemini-Multi": "Gemini 2.0 Multi-Image"
+}
